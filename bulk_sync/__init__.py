@@ -28,8 +28,7 @@ def bulk_sync(
             is being used as a key field, be sure to pass the `fieldname_id` rather than the `fieldname`.
     `filters`: Q() filters specifying the subset of the database to work in. Use `None` or `[]` if you want to sync
             against the entire table.
-    `batch_size`: (optional) passes through to Django `bulk_create.batch_size` and `bulk_update.batch_size`, and controls
-            how many objects are created/updated per SQL query.
+    `batch_size`: (optional) how many objects are created/updated per SQL query.
     `fields`: (optional) list of fields to update. If not set, will sync all fields that are editable and not
             auto-created.
     `exclude_fields`: (optional) list of fields to exclude from updates. Subtracts from the passed-in `fields` or
@@ -77,67 +76,90 @@ def bulk_sync(
 
         fields = list(fields_to_update - fields_to_exclude)
 
+    return _bulk_sync(
+        db_class,
+        new_models,
+        key_fields,
+        filters,
+        batch_size,
+        fields,
+        select_for_update_of,
+        skip_creates,
+        skip_updates,
+        skip_deletes
+    )
+
+
+def _bulk_sync(db_class, new_models, key_fields, filters, batch_size=None, fields=None, select_for_update_of=None, skip_creates=False, skip_updates=False, skip_deletes=False):
+    stats = {"created": 0, "updated": 0, "deleted": 0}
     using = router.db_for_write(db_class)
-    with transaction.atomic(using=using):
-        objs = db_class.objects.all()
+    with transaction.atomic(using=using, savepoint=True, durable=True):
+        qs = db_class.objects.all()
         if filters:
-            objs = objs.filter(filters)
-
-        ofargs = {}
-        if select_for_update_of:
-            ofargs = {"of": select_for_update_of}
-
-        objs = objs.only("pk", *key_fields).select_for_update(**ofargs).order_by("pk")
-
-        prep_functions = defaultdict(lambda: lambda x: x)
-        prep_functions.update(
-            {
-                field.name: functools.partial(field.to_python)
-                for field in (db_class._meta.get_field(k) for k in key_fields)
-                if hasattr(field, "to_python")
-            }
-        )
-
-        def get_key(obj, prep_values=False):
-            return tuple(prep_functions[k](getattr(obj, k)) if prep_values else getattr(obj, k) for k in key_fields)
-
-        obj_dict = {get_key(obj): obj for obj in objs}
-
-        new_objs = []
-        existing_objs = []
-        for new_obj in new_models:
-            old_obj = obj_dict.pop(get_key(new_obj, prep_values=True), None)
-            if old_obj is None:
-                # This is a new object, so create it.
-                new_objs.append(new_obj)
+            qs = qs.filter(filters)
+        count_all = qs.count()
+        count_processed = 0
+        if batch_size is None:
+            batch_size = count_all
+        while count_processed < count_all:
+            if batch_size == count_all:
+                objs = qs.all()
             else:
-                new_obj.pk = old_obj.pk
-                existing_objs.append(new_obj)
+                objs = qs.all()[count_processed: batch_size]
+            
+            count_processed += batch_size
 
-        if not skip_creates:
-            db_class.objects.bulk_create(new_objs, batch_size=batch_size)
+            ofargs = {}
+            if select_for_update_of:
+                ofargs = {"of": select_for_update_of}
 
-        if not skip_updates:
-            db_class.objects.bulk_update(existing_objs, fields=fields, batch_size=batch_size)
+            objs = objs.only("pk", *key_fields).select_for_update(**ofargs).order_by("pk")
 
-        if not skip_deletes:
-            # delete stale objects
-            objs.filter(pk__in=[_.pk for _ in list(obj_dict.values())]).delete()
-
-        assert len(existing_objs) == len(new_models) - len(new_objs)
-
-        stats = {
-            "created": 0 if skip_creates else len(new_objs),
-            "updated": 0 if skip_updates else (len(new_models) - len(new_objs)),
-            "deleted": 0 if skip_deletes else len(obj_dict),
-        }
-
-        logger.debug(
-            "{}: {} created, {} updated, {} deleted.".format(
-                db_class.__name__, stats["created"], stats["updated"], stats["deleted"]
+            prep_functions = defaultdict(lambda: lambda x: x)
+            prep_functions.update(
+                {
+                    field.name: functools.partial(field.to_python)
+                    for field in (db_class._meta.get_field(k) for k in key_fields)
+                    if hasattr(field, "to_python")
+                }
             )
-        )
 
+            def get_key(obj, prep_values=False):
+                return tuple(prep_functions[k](getattr(obj, k)) if prep_values else getattr(obj, k) for k in key_fields)
+
+            obj_dict = {get_key(obj): obj for obj in objs}
+
+            new_objs = []
+            existing_objs = []
+            for new_obj in new_models:
+                old_obj = obj_dict.pop(get_key(new_obj, prep_values=True), None)
+                if old_obj is None:
+                    # This is a new object, so create it.
+                    new_objs.append(new_obj)
+                else:
+                    new_obj.pk = old_obj.pk
+                    existing_objs.append(new_obj)
+
+            if not skip_creates:
+                db_class.objects.bulk_create(new_objs)
+                stats["created"] += len(new_objs)
+
+            if not skip_updates:
+                db_class.objects.bulk_update(existing_objs, fields=fields)
+                stats["updated"] += len(existing_objs)
+
+            if not skip_deletes:
+                # delete stale objects
+                objs.filter(pk__in=[_.pk for _ in list(obj_dict.values())]).delete()
+                stats["deleted"] += len(obj_dict)
+
+            assert len(existing_objs) == len(new_models) - len(new_objs)
+
+    logger.debug(
+        "{}: {} created, {} updated, {} deleted.".format(
+            db_class.__name__, stats["created"], stats["updated"], stats["deleted"]
+        )
+    )
     return {"stats": stats}
 
 
