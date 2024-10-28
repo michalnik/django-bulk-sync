@@ -60,7 +60,9 @@ def move_records_to_temporary_table(instances: list[GenModel], batch_size: int =
     temp_model_klass.objects.bulk_create(instances, batch_size=batch_size)
 
 
-def bulk_sync(model_klass: GenModel, temp_model_klass: GenModel, key_fields: list[str], fields: list[str]=None, exclude_fields: list[str]=None, skip_creates: bool=True, skip_updates: bool=True, skip_deletes: bool=True):
+def bulk_sync(model_klass: GenModel, temp_model_klass: GenModel, key_fields: list[str], fields: list[str] = None,
+              exclude_fields: list[str] = None, skip_creates: bool = True, skip_updates: bool = True,
+              skip_deletes: bool = True):
     stats = {"inserted": 0, "updated": 0, "deleted": 0}
     set_key_fields = set(key_fields)
     set_fields = set(fields)
@@ -69,20 +71,36 @@ def bulk_sync(model_klass: GenModel, temp_model_klass: GenModel, key_fields: lis
         with connection.cursor() as cursor:
             if not skip_creates:
                 insert_fields = ", ".join(set_key_fields | set_fields - set_exclude_fields)
-                keys = ", ".join(key_fields)
-                select_parts = ", ".join([f"origin.{name}" for name in insert_fields])
-                keys_filter = " AND ".join([f"origin.{key_name} = upstream.{key_name}" for key_name in key_fields])
+                lookup_fields = ", ".join(set_key_fields)
+                origin_fields = ", ".join([f"origin.{name}" for name in insert_fields])
+                join_filter = " AND ".join([f"origin.{key_name} = upstream.{key_name}" for key_name in key_fields])
+
                 insert_sql = f"""
-    WITH inserted_rows AS (
-        INSERT INTO {model_klass._meta.db_table} ({insert_fields})
-        SELECT {select_parts} FROM {temp_model_klass._meta.db_table} AS origin
-        WHERE NOT EXISTS (
-            SELECT 1 FROM {model_klass._meta.db_table} AS upstream WHERE {keys_filter}
-        )
-        RETURNING {keys}
+WITH inserted_rows AS (
+    INSERT INTO {model_klass._meta.db_table} ({insert_fields})
+    SELECT {origin_fields} FROM {temp_model_klass._meta.db_table} AS origin
+    WHERE NOT EXISTS (
+        SELECT 1 FROM {model_klass._meta.db_table} AS upstream WHERE {join_filter}
     )
-    DELETE FROM {temp_model_klass._meta.db_table} WHERE {keys} IN (SELECT {keys} FROM inserted_rows);
-    SELECT COUNT(*) FROM inserted_rows;"""
+    RETURNING {lookup_fields}
+)
+DELETE FROM {temp_model_klass._meta.db_table} WHERE {lookup_fields} IN (SELECT {lookup_fields} FROM inserted_rows);
+SELECT COUNT(*) FROM inserted_rows;"""
+
                 cursor.execute(insert_sql)
                 stats["inserted"] = cursor.fetchone()[0]
+            if not skip_updates:
+                updated_fields = ", ".join([f"upstream.{field_name} = origin.{field_name}" for field_name in set_fields - set_exclude_fields])
+
+                update_sql = f"""
+WITH updated_rows AS (
+    UPDATE {model_klass._meta.db_table} AS upstream
+    SET {updated_fields} FROM {temp_model_klass._meta.db_table} AS origin WHERE {join_filter}
+    RETURNING {lookup_fields}
+)
+DELETE FROM {temp_model_klass._meta.db_table} WHERE {lookup_fields} IN (SELECT {lookup_fields} FROM updated_rows)
+RETURNING COUNT(*) AS deleted_count;"""
+
+                cursor.execute(update_sql)
+                stats["updated"] = cursor.fetchone()[0]
     return {"stats": stats}
