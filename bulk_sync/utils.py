@@ -84,8 +84,8 @@ WITH inserted_rows AS (
     )
     RETURNING {lookup_fields}
 )
-DELETE FROM {temp_model_klass._meta.db_table} WHERE {lookup_fields} IN (SELECT {lookup_fields} FROM inserted_rows);
-SELECT COUNT(*) FROM inserted_rows;"""
+DELETE FROM {temp_model_klass._meta.db_table} WHERE {lookup_fields} IN (SELECT {lookup_fields} FROM inserted_rows)
+RETURNING COUNT(*) AS inserted_count;"""
 
                 cursor.execute(insert_sql)
                 stats["inserted"] = cursor.fetchone()[0]
@@ -99,7 +99,7 @@ WITH updated_rows AS (
     RETURNING {lookup_fields}
 )
 DELETE FROM {temp_model_klass._meta.db_table} WHERE {lookup_fields} IN (SELECT {lookup_fields} FROM updated_rows)
-RETURNING COUNT(*) AS deleted_count;"""
+RETURNING COUNT(*) AS updated_count;"""
 
                 cursor.execute(update_sql)
                 stats["updated"] = cursor.fetchone()[0]
